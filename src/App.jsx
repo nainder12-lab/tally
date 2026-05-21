@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Calendar, LayoutDashboard, Plus, Briefcase, Clock, DollarSign, AlertTriangle, ChevronLeft, ChevronRight, X, Edit2, Trash2, Bell, Download, Moon, Sun, Filter, TrendingUp, CalendarDays, Check } from 'lucide-react';
+import { Calendar, LayoutDashboard, Plus, Briefcase, Clock, DollarSign, AlertTriangle, ChevronLeft, ChevronRight, X, Edit2, Trash2, Bell, Download, Moon, Sun, Filter, TrendingUp, CalendarDays, Check, CalendarPlus, ArrowUpRight } from 'lucide-react';
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 
 // ============== UTILS ==============
@@ -84,6 +84,13 @@ const calculatePassiveBreakdown = (startTime, endTime, passiveStart = '21:00', p
 };
 
 // Returns the effective hourly rate for a given Date (using the job's weekend rates if set).
+// For displaying hours in summaries — a passive night counts as 1 hour regardless of actual length.
+// Pay is unaffected; this is just for hour-total displays.
+const displayHours = (shift) => {
+  if (shift.isPassiveNight) return 1;
+  return calculateHours(shift.startTime, shift.endTime);
+};
+
 const getRateForDate = (date, job, fallbackRate) => {
   if (!job) return fallbackRate;
   const day = date.getDay(); // 0=Sun, 6=Sat
@@ -201,15 +208,18 @@ const calculateEarnings = (shift, job) => {
 };
 
 const getWeekRange = (date) => {
+  // Week starts on Thursday (day 4)
   const d = new Date(date);
-  const day = d.getDay();
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1); // Monday start
-  const monday = new Date(d.setDate(diff));
-  monday.setHours(0,0,0,0);
-  const sunday = new Date(monday);
-  sunday.setDate(monday.getDate() + 6);
-  sunday.setHours(23,59,59,999);
-  return [monday, sunday];
+  const day = d.getDay(); // 0=Sun..6=Sat
+  // Days back to most recent Thursday: if today is Thu(4) -> 0, Fri(5) -> 1, Sat(6) -> 2, Sun(0) -> 3, Mon(1) -> 4, Tue(2) -> 5, Wed(3) -> 6
+  const daysBack = (day - 4 + 7) % 7;
+  const thursday = new Date(d);
+  thursday.setDate(d.getDate() - daysBack);
+  thursday.setHours(0,0,0,0);
+  const wednesday = new Date(thursday);
+  wednesday.setDate(thursday.getDate() + 6);
+  wednesday.setHours(23,59,59,999);
+  return [thursday, wednesday];
 };
 
 const detectConflicts = (shifts) => {
@@ -294,10 +304,42 @@ export default function App() {
   const [detailShift, setDetailShift] = useState(null);
   const [filterJob, setFilterJob] = useState('all');
   const [toast, setToast] = useState(null);
-  const notifiedRef = useRef(new Set());
 
   useEffect(() => { saveData(data); }, [data]);
   useEffect(() => { savePrefs(prefs); }, [prefs]);
+
+  // Keep refs of the current view + modals so the popstate handler reads fresh values
+  const viewRef = useRef('dashboard');
+  const editingShiftRef = useRef(null);
+  const detailShiftRef = useRef(null);
+  useEffect(() => { viewRef.current = view; }, [view]);
+  useEffect(() => { editingShiftRef.current = editingShift; }, [editingShift]);
+  useEffect(() => { detailShiftRef.current = detailShift; }, [detailShift]);
+
+  // ---- Back button handling ----
+  // Single popstate listener. When the user presses back:
+  //  1. If a modal is open, close it.
+  //  2. Otherwise, if not on dashboard, go to dashboard.
+  //  3. Otherwise, allow default behavior (could exit PWA).
+  // We push a sentinel history entry on mount so there's always something to "pop" off.
+  useEffect(() => {
+    window.history.pushState({ tallyApp: true }, '');
+
+    const handlePop = () => {
+      if (editingShiftRef.current !== null) {
+        setEditingShift(null);
+        window.history.pushState({ tallyApp: true }, '');
+      } else if (detailShiftRef.current !== null) {
+        setDetailShift(null);
+        window.history.pushState({ tallyApp: true }, '');
+      } else if (viewRef.current !== 'dashboard') {
+        setView('dashboard');
+        window.history.pushState({ tallyApp: true }, '');
+      }
+    };
+    window.addEventListener('popstate', handlePop);
+    return () => window.removeEventListener('popstate', handlePop);
+  }, []);
 
   const conflicts = useMemo(() => detectConflicts(data.shifts), [data.shifts]);
   const jobMap = useMemo(() => Object.fromEntries(data.jobs.map(j => [j.id, j])), [data.jobs]);
@@ -307,9 +349,29 @@ export default function App() {
     return data.shifts.filter(s => s.jobId === filterJob);
   }, [data.shifts, filterJob]);
 
-  // Notification check
+  // Notification check (browser notifications + in-app toast fallback)
   useEffect(() => {
     if (!prefs.notifications) return;
+
+    // Load already-sent notification IDs from localStorage so they don't re-fire on reload
+    const NOTIF_LOG_KEY = 'tally_notif_log_v1';
+    let sentIds;
+    try { sentIds = new Set(JSON.parse(localStorage.getItem(NOTIF_LOG_KEY) || '[]')); }
+    catch { sentIds = new Set(); }
+
+    const sendNotification = (title, body, tag) => {
+      // Try browser Notification API first
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        try {
+          new Notification(title, { body, icon: '/icon-192.png', badge: '/icon-192.png', tag });
+        } catch (e) {
+          showToast(`${title}: ${body}`, 'bell');
+        }
+      } else {
+        showToast(`${title}: ${body}`, 'bell');
+      }
+    };
+
     const check = () => {
       const now = new Date();
       data.shifts.forEach(s => {
@@ -318,22 +380,42 @@ export default function App() {
         const hrs = diff / (1000 * 60 * 60);
         const job = jobMap[s.jobId];
         if (!job) return;
-        // 24hr reminder
-        if (hrs > 23.9 && hrs < 24.1 && !notifiedRef.current.has(`24-${s.id}`)) {
-          notifiedRef.current.add(`24-${s.id}`);
-          showToast(`Reminder: ${job.name} shift tomorrow at ${fmtTime(s.startTime)}`, 'bell');
+
+        // 24hr reminder window: between 23.5 and 24.5 hours away
+        const id24 = `24-${s.id}`;
+        if (hrs > 23.5 && hrs < 24.5 && !sentIds.has(id24)) {
+          sentIds.add(id24);
+          sendNotification('Shift tomorrow', `${job.name} at ${fmtTime(s.startTime)}`, id24);
         }
-        // 1hr reminder
-        if (hrs > 0.9 && hrs < 1.1 && !notifiedRef.current.has(`1-${s.id}`)) {
-          notifiedRef.current.add(`1-${s.id}`);
-          showToast(`Starting soon: ${job.name} in 1 hour`, 'bell');
+        // 1hr reminder window: between 0.5 and 1.5 hours away
+        const id1 = `1-${s.id}`;
+        if (hrs > 0.5 && hrs < 1.5 && !sentIds.has(id1)) {
+          sentIds.add(id1);
+          sendNotification('Starting soon', `${job.name} in 1 hour`, id1);
         }
       });
+      // Prune old sent IDs (for shifts that no longer exist or are deeply past)
+      const validIds = new Set();
+      data.shifts.forEach(s => { validIds.add(`24-${s.id}`); validIds.add(`1-${s.id}`); });
+      const pruned = Array.from(sentIds).filter(id => validIds.has(id));
+      try { localStorage.setItem(NOTIF_LOG_KEY, JSON.stringify(pruned)); } catch {}
     };
     check();
     const id = setInterval(check, 60000);
     return () => clearInterval(id);
   }, [data.shifts, jobMap, prefs.notifications]);
+
+  // Request notification permission once on mount if not already decided
+  useEffect(() => {
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission === 'default' && prefs.notifications) {
+      // Request after a short delay so the page has settled
+      const t = setTimeout(() => {
+        try { Notification.requestPermission(); } catch {}
+      }, 2000);
+      return () => clearTimeout(t);
+    }
+  }, [prefs.notifications]);
 
   const showToast = (msg, icon = 'check') => {
     setToast({ msg, icon, id: Date.now() });
@@ -598,7 +680,7 @@ function Dashboard({ data, jobMap, conflicts, prefs, onViewShift, onSetView, car
 
   const weekEarnings = weekShifts.reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
   const monthEarnings = monthShifts.reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
-  const weekHours = weekShifts.reduce((sum, s) => sum + calculateHours(s.startTime, s.endTime), 0);
+  const weekHours = weekShifts.reduce((sum, s) => sum + displayHours(s), 0);
 
   const upcoming = data.shifts
     .filter(s => {
@@ -786,7 +868,7 @@ function CalendarView({ shifts, jobs, jobMap, conflicts, onViewShift, onAddShift
   const monthIdx = month.getMonth();
   const firstDay = new Date(year, monthIdx, 1);
   const lastDay = new Date(year, monthIdx + 1, 0);
-  const startDay = (firstDay.getDay() + 6) % 7; // Monday start
+  const startDay = (firstDay.getDay() - 4 + 7) % 7; // Thursday start (Thu=0, Fri=1, ..., Wed=6)
   const daysInMonth = lastDay.getDate();
   const weeks = [];
   let week = Array(startDay).fill(null);
@@ -813,7 +895,7 @@ function CalendarView({ shifts, jobs, jobMap, conflicts, onViewShift, onAddShift
   const isToday = (d) => d === todayD.getDate() && monthIdx === todayD.getMonth() && year === todayD.getFullYear();
 
   const monthEarnings = Object.values(monthShifts).flat().reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
-  const monthHours = Object.values(monthShifts).flat().reduce((sum, s) => sum + calculateHours(s.startTime, s.endTime), 0);
+  const monthHours = Object.values(monthShifts).flat().reduce((sum, s) => sum + displayHours(s), 0);
 
   return (
     <div className="animate-fade-in">
@@ -870,7 +952,7 @@ function CalendarView({ shifts, jobs, jobMap, conflicts, onViewShift, onAddShift
       <div className={`rounded-2xl border ${cardClass} overflow-hidden`}>
         {/* Day headers */}
         <div className={`grid grid-cols-7 ${prefs.dark ? 'bg-stone-900 border-stone-800' : 'bg-stone-100/50 border-stone-200'} border-b`}>
-          {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d => (
+          {['Thu','Fri','Sat','Sun','Mon','Tue','Wed'].map(d => (
             <div key={d} className={`px-2 py-2.5 text-[10px] uppercase tracking-widest font-medium text-center ${subtleText}`}>
               <span className="hidden sm:inline">{d}</span>
               <span className="sm:hidden">{d[0]}</span>
@@ -939,14 +1021,14 @@ function EarningsView({ shifts, jobs, jobMap, prefs, cardClass, subtleText }) {
   const now = new Date();
 
   const allEarnings = shifts.reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
-  const allHours = shifts.reduce((sum, s) => sum + calculateHours(s.startTime, s.endTime), 0);
+  const allHours = shifts.reduce((sum, s) => sum + displayHours(s), 0);
 
   // Per job
   const byJob = useMemo(() => {
     return jobs.map(j => {
       const js = shifts.filter(s => s.jobId === j.id);
       const earnings = js.reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
-      const hours = js.reduce((sum, s) => sum + calculateHours(s.startTime, s.endTime), 0);
+      const hours = js.reduce((sum, s) => sum + displayHours(s), 0);
       return { ...j, earnings, hours, shifts: js.length, color: JOB_COLORS[j.colorIdx] };
     }).sort((a,b) => b.earnings - a.earnings);
   }, [shifts, jobs]);
@@ -1588,7 +1670,46 @@ function ShiftDetail({ shift, job, isConflict, onEdit, onDelete, onClose, prefs 
             </div>
           )}
 
-          <div className="flex gap-2 pt-2">
+          <button
+            onClick={() => {
+              // Build Google Calendar URL
+              const toGCalDate = (dateStr, timeStr) => {
+                const [y, m, d] = dateStr.split('-').map(Number);
+                const [h, min] = timeStr.split(':').map(Number);
+                const dt = new Date(y, m - 1, d, h, min);
+                const pad = (n) => String(n).padStart(2, '0');
+                return `${dt.getFullYear()}${pad(dt.getMonth()+1)}${pad(dt.getDate())}T${pad(dt.getHours())}${pad(dt.getMinutes())}00`;
+              };
+              const startStr = toGCalDate(shift.date, shift.startTime);
+              // Compute end date — may roll to next day for overnight
+              const [sy, sm, sd] = shift.date.split('-').map(Number);
+              const [sh, smin] = shift.startTime.split(':').map(Number);
+              const [eh, emin] = shift.endTime.split(':').map(Number);
+              const sDt = new Date(sy, sm - 1, sd, sh, smin);
+              let eDt = new Date(sy, sm - 1, sd, eh, emin);
+              if (eDt <= sDt) eDt.setDate(eDt.getDate() + 1);
+              const pad = (n) => String(n).padStart(2, '0');
+              const endStr = `${eDt.getFullYear()}${pad(eDt.getMonth()+1)}${pad(eDt.getDate())}T${pad(eDt.getHours())}${pad(eDt.getMinutes())}00`;
+
+              const details = [
+                `Earnings: ${fmtCurrency(earnings)}`,
+                shift.isPassiveNight ? 'Passive night shift' : '',
+                shift.notes ? `Notes: ${shift.notes}` : '',
+              ].filter(Boolean).join('\n');
+
+              const url = `https://calendar.google.com/calendar/render?action=TEMPLATE` +
+                `&text=${encodeURIComponent(job.name + (shift.isPassiveNight ? ' (passive)' : ''))}` +
+                `&dates=${startStr}/${endStr}` +
+                `&details=${encodeURIComponent(details)}`;
+              window.open(url, '_blank');
+            }}
+            className={`w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 ${prefs.dark ? 'bg-stone-800 text-stone-200 hover:bg-stone-700' : 'bg-stone-100 text-stone-700 hover:bg-stone-200'}`}
+          >
+            <CalendarPlus className="w-4 h-4" /> Add to Google Calendar
+            <ArrowUpRight className="w-3 h-3 opacity-50" />
+          </button>
+
+          <div className="flex gap-2">
             <button onClick={onDelete} className={`flex-1 py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 ${prefs.dark ? 'bg-red-950 text-red-400 hover:bg-red-900' : 'bg-red-50 text-red-600 hover:bg-red-100'}`}>
               <Trash2 className="w-4 h-4" /> Delete
             </button>
