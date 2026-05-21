@@ -855,7 +855,7 @@ function ShiftCard({ shift, job, isConflict, onClick, prefs, showDate }) {
       </div>
       <div className="text-right">
         <p className="font-display font-semibold">{fmtCurrency(earnings)}</p>
-        <p className={`text-[10px] ${prefs.dark ? 'text-stone-500' : 'text-stone-400'}`}>{hrs.toFixed(1)}h</p>
+        <p className={`text-[10px] ${prefs.dark ? 'text-stone-500' : 'text-stone-400'}`}>{displayHours(shift).toFixed(1)}h</p>
       </div>
     </button>
   );
@@ -1543,8 +1543,8 @@ function ShiftForm({ shift, jobs, onSave, onDelete, onCancel, prefs }) {
               {isPassiveNight && breakdown ? (
                 <>
                   <div className="flex justify-between text-sm">
-                    <span className={prefs.dark ? 'text-stone-400' : 'text-stone-600'}>Passive hours</span>
-                    <span className="font-medium">{breakdown.passiveHours.toFixed(2)}h · {fmtCurrency(parseFloat(passiveFlatRate) || 0)}</span>
+                    <span className={prefs.dark ? 'text-stone-400' : 'text-stone-600'}>Passive (counts as 1h)</span>
+                    <span className="font-medium">{breakdown.passiveHours.toFixed(1)}h worked · {fmtCurrency(parseFloat(passiveFlatRate) || 0)}</span>
                   </div>
                   <div className="flex justify-between text-sm mt-1">
                     <span className={prefs.dark ? 'text-stone-400' : 'text-stone-600'}>Active hours</span>
@@ -1636,8 +1636,10 @@ function ShiftDetail({ shift, job, isConflict, onEdit, onDelete, onClose, prefs 
             </div>
             <div>
               <p className={`text-[10px] uppercase tracking-widest font-medium ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>Duration</p>
-              <p className="font-display text-xl font-semibold mt-1">{hrs.toFixed(2)}h</p>
-              <p className={`text-sm ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>{shift.isPassiveNight ? 'mixed pay' : `at $${shift.hourlyRate}/hr`}</p>
+              <p className="font-display text-xl font-semibold mt-1">{displayHours(shift).toFixed(2)}h</p>
+              <p className={`text-sm ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>
+                {shift.isPassiveNight ? `${hrs.toFixed(1)}h worked` : `at $${shift.hourlyRate}/hr`}
+              </p>
             </div>
           </div>
 
@@ -1645,7 +1647,7 @@ function ShiftDetail({ shift, job, isConflict, onEdit, onDelete, onClose, prefs 
             <div className={`rounded-xl p-4 ${prefs.dark ? 'bg-stone-800/50' : 'bg-stone-100'} space-y-2`}>
               <div className="flex justify-between text-sm">
                 <span className={`flex items-center gap-1.5 ${prefs.dark ? 'text-stone-400' : 'text-stone-600'}`}>
-                  <Moon className="w-3.5 h-3.5" /> Passive ({breakdown.passiveHours.toFixed(2)}h)
+                  <Moon className="w-3.5 h-3.5" /> Passive (1h · {breakdown.passiveHours.toFixed(1)}h worked)
                 </span>
                 <span className="font-medium">{fmtCurrency(shift.passiveFlatRate ?? 120)}</span>
               </div>
