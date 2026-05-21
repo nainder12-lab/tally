@@ -84,10 +84,16 @@ const calculatePassiveBreakdown = (startTime, endTime, passiveStart = '21:00', p
 };
 
 // Returns the effective hourly rate for a given Date (using the job's weekend rates if set).
-// For displaying hours in summaries — a passive night counts as 1 hour regardless of actual length.
+// For displaying hours in summaries — a passive shift's passive *window* counts as 1 hour
+// (regardless of its real length), plus the actual active hours outside the window.
 // Pay is unaffected; this is just for hour-total displays.
 const displayHours = (shift) => {
-  if (shift.isPassiveNight) return 1;
+  if (shift.isPassiveNight) {
+    const passiveStart = shift.passiveStart || '21:00';
+    const passiveEnd = shift.passiveEnd || '08:00';
+    const { activeHours } = calculatePassiveBreakdown(shift.startTime, shift.endTime, passiveStart, passiveEnd);
+    return 1 + activeHours;
+  }
   return calculateHours(shift.startTime, shift.endTime);
 };
 
