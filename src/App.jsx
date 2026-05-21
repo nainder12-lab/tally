@@ -42,7 +42,163 @@ const calculateHours = (start, end) => {
   return mins / 60;
 };
 
-const calculateEarnings = (shift) => calculateHours(shift.startTime, shift.endTime) * shift.hourlyRate;
+// Calculates how many hours of a shift fall OUTSIDE the passive window (9pm-8am).
+// Returns active hours (paid hourly) and whether passive overlap exists (gets flat rate).
+const calculatePassiveBreakdown = (startTime, endTime, passiveStart = '21:00', passiveEnd = '08:00') => {
+  const toMin = (t) => { const [h,m] = t.split(':').map(Number); return h*60 + m; };
+  const sMin = toMin(startTime);
+  let eMin = toMin(endTime);
+  if (eMin <= sMin) eMin += 24*60; // overnight
+
+  const pStart = toMin(passiveStart); // e.g. 21:00 = 1260
+  let pEnd = toMin(passiveEnd);       // e.g. 08:00 = 480
+  if (pEnd <= pStart) pEnd += 24*60;  // passive window crosses midnight: 1260..1920 (next day 8am)
+
+  // Build the passive window relative to the shift's day.
+  // We need to consider that the shift may start before pStart on day 1,
+  // and the passive window itself spans into the next day.
+  // Approach: treat everything on a 0..48h timeline.
+  // Shift: [sMin, eMin]. Passive intervals to check: [pStart, pEnd] and [pStart-1440, pEnd-1440] (previous day's window into today).
+  const passiveIntervals = [
+    [pStart, pEnd],
+    [pStart - 1440, pEnd - 1440],
+    [pStart + 1440, pEnd + 1440],
+  ];
+
+  let passiveOverlapMin = 0;
+  passiveIntervals.forEach(([ps, pe]) => {
+    const overlapStart = Math.max(sMin, ps);
+    const overlapEnd = Math.min(eMin, pe);
+    if (overlapEnd > overlapStart) passiveOverlapMin += (overlapEnd - overlapStart);
+  });
+
+  const totalMin = eMin - sMin;
+  const activeMin = totalMin - passiveOverlapMin;
+
+  return {
+    totalHours: totalMin / 60,
+    activeHours: activeMin / 60,
+    passiveHours: passiveOverlapMin / 60,
+    hasPassiveOverlap: passiveOverlapMin > 0,
+  };
+};
+
+// Returns the effective hourly rate for a given Date (using the job's weekend rates if set).
+const getRateForDate = (date, job, fallbackRate) => {
+  if (!job) return fallbackRate;
+  const day = date.getDay(); // 0=Sun, 6=Sat
+  if (day === 0 && job.sundayRate) return job.sundayRate;
+  if (day === 6 && job.saturdayRate) return job.saturdayRate;
+  return fallbackRate;
+};
+
+// Calculates active hours broken down by which calendar day they fall on.
+// Returns array of {date: Date, hours: number} entries.
+const splitActiveHoursByDay = (shift, breakdown) => {
+  const toMin = (t) => { const [h,m] = t.split(':').map(Number); return h*60 + m; };
+  const sMin = toMin(shift.startTime);
+  let eMin = toMin(shift.endTime);
+  if (eMin <= sMin) eMin += 24*60;
+
+  const passiveStart = shift.passiveStart || '21:00';
+  const passiveEnd = shift.passiveEnd || '08:00';
+  const pStart = toMin(passiveStart);
+  let pEnd = toMin(passiveEnd);
+  if (pEnd <= pStart) pEnd += 24*60;
+
+  // Build set of passive intervals (possibly multiple due to crossing midnight)
+  const passiveIntervals = [
+    [pStart, pEnd],
+    [pStart - 1440, pEnd - 1440],
+    [pStart + 1440, pEnd + 1440],
+  ];
+
+  // For each minute in [sMin, eMin), determine if it's active and which day it's on.
+  // Day boundary is at minute 1440.
+  const baseDate = new Date(shift.date + 'T00:00:00');
+  const day1Date = new Date(baseDate);
+  const day2Date = new Date(baseDate); day2Date.setDate(day2Date.getDate() + 1);
+
+  let day1Active = 0;
+  let day2Active = 0;
+
+  // Sample by checking ranges, not per-minute (more efficient)
+  // We need to iterate through [sMin, eMin), subtract passive intervals, then split at 1440.
+  let activeRanges = [[sMin, eMin]];
+  passiveIntervals.forEach(([ps, pe]) => {
+    const newRanges = [];
+    activeRanges.forEach(([rs, re]) => {
+      const overlapStart = Math.max(rs, ps);
+      const overlapEnd = Math.min(re, pe);
+      if (overlapEnd <= overlapStart) {
+        newRanges.push([rs, re]); // no overlap
+      } else {
+        if (rs < overlapStart) newRanges.push([rs, overlapStart]);
+        if (overlapEnd < re) newRanges.push([overlapEnd, re]);
+      }
+    });
+    activeRanges = newRanges;
+  });
+
+  // Split active ranges at the 1440 boundary (midnight)
+  activeRanges.forEach(([rs, re]) => {
+    if (re <= 1440) {
+      day1Active += (re - rs);
+    } else if (rs >= 1440) {
+      day2Active += (re - rs);
+    } else {
+      day1Active += (1440 - rs);
+      day2Active += (re - 1440);
+    }
+  });
+
+  return [
+    { date: day1Date, hours: day1Active / 60 },
+    { date: day2Date, hours: day2Active / 60 },
+  ];
+};
+
+const calculateEarnings = (shift, job) => {
+  if (shift.isPassiveNight) {
+    const flatRate = shift.passiveFlatRate ?? 120;
+    const passiveStart = shift.passiveStart || '21:00';
+    const passiveEnd = shift.passiveEnd || '08:00';
+    const breakdown = calculatePassiveBreakdown(shift.startTime, shift.endTime, passiveStart, passiveEnd);
+
+    // Split active hours by day to apply correct weekday/weekend rate
+    const dayHours = splitActiveHoursByDay(shift, breakdown);
+    let activeEarnings = 0;
+    dayHours.forEach(({ date, hours }) => {
+      const rate = getRateForDate(date, job, shift.hourlyRate);
+      activeEarnings += hours * rate;
+    });
+
+    return flatRate + activeEarnings;
+  }
+
+  // Non-passive: split entire shift by day for weekend rates
+  const toMin = (t) => { const [h,m] = t.split(':').map(Number); return h*60 + m; };
+  const sMin = toMin(shift.startTime);
+  let eMin = toMin(shift.endTime);
+  if (eMin <= sMin) eMin += 24*60;
+
+  const baseDate = new Date(shift.date + 'T00:00:00');
+  const day2Date = new Date(baseDate); day2Date.setDate(day2Date.getDate() + 1);
+
+  let day1Min = 0, day2Min = 0;
+  if (eMin <= 1440) {
+    day1Min = eMin - sMin;
+  } else if (sMin >= 1440) {
+    day2Min = eMin - sMin;
+  } else {
+    day1Min = 1440 - sMin;
+    day2Min = eMin - 1440;
+  }
+
+  const day1Rate = getRateForDate(baseDate, job, shift.hourlyRate);
+  const day2Rate = getRateForDate(day2Date, job, shift.hourlyRate);
+  return (day1Min / 60) * day1Rate + (day2Min / 60) * day2Rate;
+};
 
 const getWeekRange = (date) => {
   const d = new Date(date);
@@ -224,14 +380,33 @@ export default function App() {
   };
 
   const exportCSV = () => {
-    const headers = ['Date', 'Job', 'Start', 'End', 'Hours', 'Rate', 'Earnings', 'Notes'];
+    const headers = ['Date', 'Job', 'Start', 'End', 'Total Hours', 'Active Hours', 'Passive Hours', 'Rate', 'Passive Pay', 'Earnings', 'Type', 'Notes'];
     const rows = [...data.shifts]
       .sort((a,b) => a.date.localeCompare(b.date))
       .map(s => {
         const job = jobMap[s.jobId];
-        const hrs = calculateHours(s.startTime, s.endTime);
-        const earn = hrs * s.hourlyRate;
-        return [s.date, job?.name || 'Unknown', s.startTime, s.endTime, hrs.toFixed(2), s.hourlyRate, earn.toFixed(2), `"${(s.notes || '').replace(/"/g,'""')}"`].join(',');
+        const totalHrs = calculateHours(s.startTime, s.endTime);
+        const breakdown = s.isPassiveNight
+          ? calculatePassiveBreakdown(s.startTime, s.endTime, s.passiveStart || '21:00', s.passiveEnd || '08:00')
+          : null;
+        const activeHrs = breakdown ? breakdown.activeHours : totalHrs;
+        const passiveHrs = breakdown ? breakdown.passiveHours : 0;
+        const passivePay = s.isPassiveNight ? (s.passiveFlatRate ?? 120) : 0;
+        const earn = calculateEarnings(s, jobMap[s.jobId]);
+        return [
+          s.date,
+          job?.name || 'Unknown',
+          s.startTime,
+          s.endTime,
+          totalHrs.toFixed(2),
+          activeHrs.toFixed(2),
+          passiveHrs.toFixed(2),
+          s.hourlyRate,
+          passivePay.toFixed(2),
+          earn.toFixed(2),
+          s.isPassiveNight ? 'Passive Night' : 'Regular',
+          `"${(s.notes || '').replace(/"/g,'""')}"`
+        ].join(',');
       });
     const csv = [headers.join(','), ...rows].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -421,8 +596,8 @@ function Dashboard({ data, jobMap, conflicts, prefs, onViewShift, onSetView, car
   });
   const todayShifts = data.shifts.filter(s => s.date === todayStr).sort((a,b) => a.startTime.localeCompare(b.startTime));
 
-  const weekEarnings = weekShifts.reduce((sum, s) => sum + calculateEarnings(s), 0);
-  const monthEarnings = monthShifts.reduce((sum, s) => sum + calculateEarnings(s), 0);
+  const weekEarnings = weekShifts.reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
+  const monthEarnings = monthShifts.reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
   const weekHours = weekShifts.reduce((sum, s) => sum + calculateHours(s.startTime, s.endTime), 0);
 
   const upcoming = data.shifts
@@ -447,7 +622,7 @@ function Dashboard({ data, jobMap, conflicts, prefs, onViewShift, onSetView, car
           const d = new Date(`${s.date}T${s.startTime}`);
           return d >= ws && d <= we;
         })
-        .reduce((sum, s) => sum + calculateEarnings(s), 0);
+        .reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
       weeks.push({
         week: `${ws.getMonth() + 1}/${ws.getDate()}`,
         earnings: parseFloat(total.toFixed(2)),
@@ -579,7 +754,7 @@ function ShiftCard({ shift, job, isConflict, onClick, prefs, showDate }) {
   if (!job) return null;
   const color = JOB_COLORS[job.colorIdx];
   const hrs = calculateHours(shift.startTime, shift.endTime);
-  const earnings = hrs * shift.hourlyRate;
+  const earnings = calculateEarnings(shift, job);
   const date = new Date(`${shift.date}T${shift.startTime}`);
   const dateLabel = date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 
@@ -589,6 +764,7 @@ function ShiftCard({ shift, job, isConflict, onClick, prefs, showDate }) {
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <p className="font-medium truncate">{job.name}</p>
+          {shift.isPassiveNight && <Moon className="w-3.5 h-3.5 shrink-0 opacity-60" />}
           {isConflict && <AlertTriangle className="w-3.5 h-3.5 text-red-500 shrink-0" />}
         </div>
         <p className={`text-xs ${prefs.dark ? 'text-stone-400' : 'text-stone-500'} mt-0.5`}>
@@ -636,7 +812,7 @@ function CalendarView({ shifts, jobs, jobMap, conflicts, onViewShift, onAddShift
   const todayD = new Date();
   const isToday = (d) => d === todayD.getDate() && monthIdx === todayD.getMonth() && year === todayD.getFullYear();
 
-  const monthEarnings = Object.values(monthShifts).flat().reduce((sum, s) => sum + calculateEarnings(s), 0);
+  const monthEarnings = Object.values(monthShifts).flat().reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
   const monthHours = Object.values(monthShifts).flat().reduce((sum, s) => sum + calculateHours(s.startTime, s.endTime), 0);
 
   return (
@@ -762,14 +938,14 @@ function EarningsView({ shifts, jobs, jobMap, prefs, cardClass, subtleText }) {
   const [period, setPeriod] = useState('week');
   const now = new Date();
 
-  const allEarnings = shifts.reduce((sum, s) => sum + calculateEarnings(s), 0);
+  const allEarnings = shifts.reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
   const allHours = shifts.reduce((sum, s) => sum + calculateHours(s.startTime, s.endTime), 0);
 
   // Per job
   const byJob = useMemo(() => {
     return jobs.map(j => {
       const js = shifts.filter(s => s.jobId === j.id);
-      const earnings = js.reduce((sum, s) => sum + calculateEarnings(s), 0);
+      const earnings = js.reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
       const hours = js.reduce((sum, s) => sum + calculateHours(s.startTime, s.endTime), 0);
       return { ...j, earnings, hours, shifts: js.length, color: JOB_COLORS[j.colorIdx] };
     }).sort((a,b) => b.earnings - a.earnings);
@@ -785,7 +961,7 @@ function EarningsView({ shifts, jobs, jobMap, prefs, cardClass, subtleText }) {
         d.setDate(d.getDate() - i);
         d.setHours(0,0,0,0);
         const ds = fmtDate(d);
-        const total = shifts.filter(s => s.date === ds).reduce((sum, s) => sum + calculateEarnings(s), 0);
+        const total = shifts.filter(s => s.date === ds).reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
         days.push({ label: d.toLocaleDateString('en-US', { weekday: 'short' }), earnings: parseFloat(total.toFixed(2)) });
       }
       return days;
@@ -798,7 +974,7 @@ function EarningsView({ shifts, jobs, jobMap, prefs, cardClass, subtleText }) {
         const total = shifts.filter(s => {
           const d = new Date(`${s.date}T${s.startTime}`);
           return d >= ws && d <= we;
-        }).reduce((sum, s) => sum + calculateEarnings(s), 0);
+        }).reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
         weeks.push({ label: `Wk ${ws.getDate()}/${ws.getMonth()+1}`, earnings: parseFloat(total.toFixed(2)) });
       }
       return weeks;
@@ -810,7 +986,7 @@ function EarningsView({ shifts, jobs, jobMap, prefs, cardClass, subtleText }) {
         const total = shifts.filter(s => {
           const d = new Date(`${s.date}T${s.startTime}`);
           return d >= ref && d <= me;
-        }).reduce((sum, s) => sum + calculateEarnings(s), 0);
+        }).reduce((sum, s) => sum + calculateEarnings(s, jobMap[s.jobId]), 0);
         months.push({ label: ref.toLocaleString('default', { month: 'short' }), earnings: parseFloat(total.toFixed(2)) });
       }
       return months;
@@ -919,7 +1095,7 @@ function JobsView({ jobs, shifts, onSave, onDelete, prefs, cardClass, subtleText
         {jobs.map(j => {
           const color = JOB_COLORS[j.colorIdx];
           const jShifts = shifts.filter(s => s.jobId === j.id);
-          const earnings = jShifts.reduce((sum, s) => sum + calculateEarnings(s), 0);
+          const earnings = jShifts.reduce((sum, s) => sum + calculateEarnings(s, j), 0);
           return (
             <div key={j.id} className={`rounded-2xl border ${cardClass} p-5`}>
               <div className="flex items-start justify-between gap-3">
@@ -929,7 +1105,12 @@ function JobsView({ jobs, shifts, onSave, onDelete, prefs, cardClass, subtleText
                   </div>
                   <div className="min-w-0">
                     <h3 className="font-display font-semibold text-lg truncate">{j.name}</h3>
-                    <p className={`text-xs ${subtleText}`}>${j.rate}/hr default</p>
+                    <p className={`text-xs ${subtleText}`}>
+                      ${j.rate}/hr
+                      {(j.saturdayRate || j.sundayRate) && (
+                        <span> · Sat ${j.saturdayRate ?? j.rate} · Sun ${j.sundayRate ?? j.rate}</span>
+                      )}
+                    </p>
                   </div>
                 </div>
                 <div className="flex gap-1">
@@ -961,12 +1142,26 @@ function JobForm({ job, onSave, onCancel, prefs }) {
   const [name, setName] = useState(job.name || '');
   const [colorIdx, setColorIdx] = useState(job.colorIdx ?? 0);
   const [rate, setRate] = useState(job.rate ?? 20);
+  const [hasWeekendRates, setHasWeekendRates] = useState(!!(job.saturdayRate || job.sundayRate));
+  const [saturdayRate, setSaturdayRate] = useState(job.saturdayRate ?? (job.rate ?? 20));
+  const [sundayRate, setSundayRate] = useState(job.sundayRate ?? (job.rate ?? 20));
   const [err, setErr] = useState('');
 
   const submit = () => {
     if (!name.trim()) { setErr('Name is required'); return; }
     if (!rate || rate <= 0) { setErr('Rate must be greater than 0'); return; }
-    onSave({ ...job, name: name.trim(), colorIdx, rate: parseFloat(rate) });
+    if (hasWeekendRates) {
+      if (!saturdayRate || saturdayRate <= 0) { setErr('Saturday rate must be greater than 0'); return; }
+      if (!sundayRate || sundayRate <= 0) { setErr('Sunday rate must be greater than 0'); return; }
+    }
+    onSave({
+      ...job,
+      name: name.trim(),
+      colorIdx,
+      rate: parseFloat(rate),
+      saturdayRate: hasWeekendRates ? parseFloat(saturdayRate) : undefined,
+      sundayRate: hasWeekendRates ? parseFloat(sundayRate) : undefined,
+    });
   };
 
   const cardBg = prefs.dark ? 'bg-stone-900' : 'bg-white';
@@ -975,7 +1170,7 @@ function JobForm({ job, onSave, onCancel, prefs }) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-end md:items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onCancel}>
-      <div className={`${cardBg} w-full md:max-w-md md:rounded-2xl rounded-t-3xl shadow-2xl animate-slide-up md:animate-fade-in`} onClick={e => e.stopPropagation()}>
+      <div className={`${cardBg} w-full md:max-w-md md:rounded-2xl rounded-t-3xl shadow-2xl animate-slide-up md:animate-fade-in max-h-[92vh] overflow-y-auto scrollbar-thin`} onClick={e => e.stopPropagation()}>
         <div className="p-6">
           <h3 className="font-display text-2xl font-semibold mb-4">{job.id ? 'Edit job' : 'New job'}</h3>
           <div className="space-y-4">
@@ -984,9 +1179,58 @@ function JobForm({ job, onSave, onCancel, prefs }) {
               <input className={inputClass} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Cafe Bellini" autoFocus />
             </div>
             <div>
-              <label className={labelClass}>Default hourly rate</label>
-              <input type="number" step="0.01" min="0" className={inputClass} value={rate} onChange={e => setRate(e.target.value)} />
+              <label className={labelClass}>Default hourly rate (weekdays)</label>
+              <div className="relative">
+                <span className={`absolute left-3 top-1/2 -translate-y-1/2 text-sm ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>$</span>
+                <input type="number" step="0.01" min="0" className={inputClass + ' pl-7'} value={rate} onChange={e => setRate(e.target.value)} />
+              </div>
             </div>
+
+            {/* Weekend rates toggle */}
+            <div className={`rounded-xl border ${prefs.dark ? 'border-stone-800 bg-stone-800/30' : 'border-stone-200 bg-stone-50'} p-4`}>
+              <label className="flex items-start gap-3 cursor-pointer">
+                <div className="relative pt-0.5">
+                  <input
+                    type="checkbox"
+                    checked={hasWeekendRates}
+                    onChange={e => setHasWeekendRates(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className={`w-10 h-6 rounded-full transition-colors ${hasWeekendRates ? (prefs.dark ? 'bg-amber-300' : 'bg-stone-900') : (prefs.dark ? 'bg-stone-700' : 'bg-stone-300')}`}>
+                    <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${hasWeekendRates ? 'translate-x-4' : ''}`} />
+                  </div>
+                </div>
+                <div className="flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <CalendarDays className="w-3.5 h-3.5" />
+                    <span className="font-medium text-sm">Weekend rates</span>
+                  </div>
+                  <p className={`text-xs mt-0.5 ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>
+                    Different pay rates for Saturday and Sunday shifts
+                  </p>
+                </div>
+              </label>
+
+              {hasWeekendRates && (
+                <div className="mt-4 grid grid-cols-2 gap-3">
+                  <div>
+                    <label className={labelClass}>Saturday</label>
+                    <div className="relative">
+                      <span className={`absolute left-3 top-1/2 -translate-y-1/2 text-sm ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>$</span>
+                      <input type="number" step="0.01" min="0" className={inputClass + ' pl-7'} value={saturdayRate} onChange={e => setSaturdayRate(e.target.value)} />
+                    </div>
+                  </div>
+                  <div>
+                    <label className={labelClass}>Sunday</label>
+                    <div className="relative">
+                      <span className={`absolute left-3 top-1/2 -translate-y-1/2 text-sm ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>$</span>
+                      <input type="number" step="0.01" min="0" className={inputClass + ' pl-7'} value={sundayRate} onChange={e => setSundayRate(e.target.value)} />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div>
               <label className={labelClass}>Color</label>
               <div className="grid grid-cols-8 gap-2">
@@ -1015,14 +1259,25 @@ function ShiftForm({ shift, jobs, onSave, onDelete, onCancel, prefs }) {
   const [endTime, setEndTime] = useState(shift.endTime || '17:00');
   const [hourlyRate, setHourlyRate] = useState(shift.hourlyRate ?? jobs.find(j => j.id === (shift.jobId || jobs[0]?.id))?.rate ?? 20);
   const [notes, setNotes] = useState(shift.notes || '');
+  const [isPassiveNight, setIsPassiveNight] = useState(shift.isPassiveNight || false);
+  const [passiveFlatRate, setPassiveFlatRate] = useState(shift.passiveFlatRate ?? 120);
+  const [passiveStart, setPassiveStart] = useState(shift.passiveStart || '21:00');
+  const [passiveEnd, setPassiveEnd] = useState(shift.passiveEnd || '08:00');
   const [err, setErr] = useState('');
 
   useEffect(() => {
     if (!shift.id) {
       const j = jobs.find(j => j.id === jobId);
-      if (j) setHourlyRate(j.rate);
+      if (j) {
+        // Pick the right rate for the selected date
+        const d = new Date(date + 'T00:00:00');
+        const dow = d.getDay();
+        if (dow === 6 && j.saturdayRate) setHourlyRate(j.saturdayRate);
+        else if (dow === 0 && j.sundayRate) setHourlyRate(j.sundayRate);
+        else setHourlyRate(j.rate);
+      }
     }
-  }, [jobId]);
+  }, [jobId, date]);
 
   const submit = () => {
     setErr('');
@@ -1030,13 +1285,38 @@ function ShiftForm({ shift, jobs, onSave, onDelete, onCancel, prefs }) {
     if (!date) { setErr('Date is required'); return; }
     if (!startTime || !endTime) { setErr('Times are required'); return; }
     if (startTime === endTime) { setErr('Start and end times cannot be identical'); return; }
-    if (endTime <= startTime) { setErr('End time must be after start time'); return; }
+    if (!isPassiveNight && endTime <= startTime) { setErr('End time must be after start time'); return; }
     if (!hourlyRate || hourlyRate <= 0) { setErr('Hourly rate must be greater than 0'); return; }
-    onSave({ ...shift, jobId, date, startTime, endTime, hourlyRate: parseFloat(hourlyRate), notes: notes.trim() });
+    if (isPassiveNight && (!passiveFlatRate || passiveFlatRate <= 0)) { setErr('Passive flat rate must be greater than 0'); return; }
+    onSave({
+      ...shift,
+      jobId, date, startTime, endTime,
+      hourlyRate: parseFloat(hourlyRate),
+      notes: notes.trim(),
+      isPassiveNight,
+      passiveFlatRate: isPassiveNight ? parseFloat(passiveFlatRate) : undefined,
+      passiveStart: isPassiveNight ? passiveStart : undefined,
+      passiveEnd: isPassiveNight ? passiveEnd : undefined,
+    });
   };
 
-  const hrs = calculateHours(startTime, endTime);
-  const earnings = hrs * (parseFloat(hourlyRate) || 0);
+  const selectedJob = jobs.find(j => j.id === jobId);
+  const breakdown = isPassiveNight
+    ? calculatePassiveBreakdown(startTime, endTime, passiveStart, passiveEnd)
+    : null;
+  const hrs = breakdown ? breakdown.totalHours : calculateHours(startTime, endTime);
+
+  // Build a preview shift to compute live earnings with weekend rates applied
+  const previewShift = {
+    jobId, date, startTime, endTime,
+    hourlyRate: parseFloat(hourlyRate) || 0,
+    isPassiveNight,
+    passiveFlatRate: parseFloat(passiveFlatRate) || 0,
+    passiveStart, passiveEnd,
+  };
+  const earnings = (startTime && endTime && hourlyRate)
+    ? calculateEarnings(previewShift, selectedJob)
+    : 0;
 
   const cardBg = prefs.dark ? 'bg-stone-900' : 'bg-white';
   const inputClass = `w-full px-3 py-2.5 rounded-lg border ${prefs.dark ? 'bg-stone-800 border-stone-700 text-stone-100' : 'bg-white border-stone-300 text-stone-900'} focus:outline-none focus:ring-2 ${prefs.dark ? 'focus:ring-amber-300' : 'focus:ring-stone-900'} text-sm`;
@@ -1112,6 +1392,62 @@ function ShiftForm({ shift, jobs, onSave, onDelete, onCancel, prefs }) {
               <span className={`absolute left-3 top-1/2 -translate-y-1/2 text-sm ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>$</span>
               <input type="number" step="0.01" min="0" className={inputClass + ' pl-7'} value={hourlyRate} onChange={e => setHourlyRate(e.target.value)} />
             </div>
+            {selectedJob && (selectedJob.saturdayRate || selectedJob.sundayRate) && (
+              <p className={`text-xs mt-1.5 ${prefs.dark ? 'text-stone-500' : 'text-stone-400'}`}>
+                This job uses weekend rates. Saturday hours pay ${selectedJob.saturdayRate ?? selectedJob.rate}/hr, Sunday hours pay ${selectedJob.sundayRate ?? selectedJob.rate}/hr.
+              </p>
+            )}
+          </div>
+
+          {/* Passive Night Toggle */}
+          <div className={`rounded-xl border ${prefs.dark ? 'border-stone-800 bg-stone-800/30' : 'border-stone-200 bg-stone-50'} p-4`}>
+            <label className="flex items-start gap-3 cursor-pointer">
+              <div className="relative pt-0.5">
+                <input
+                  type="checkbox"
+                  checked={isPassiveNight}
+                  onChange={e => setIsPassiveNight(e.target.checked)}
+                  className="sr-only peer"
+                />
+                <div className={`w-10 h-6 rounded-full transition-colors ${isPassiveNight ? (prefs.dark ? 'bg-amber-300' : 'bg-stone-900') : (prefs.dark ? 'bg-stone-700' : 'bg-stone-300')}`}>
+                  <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${isPassiveNight ? 'translate-x-4' : ''}`} />
+                </div>
+              </div>
+              <div className="flex-1">
+                <div className="flex items-center gap-1.5">
+                  <Moon className="w-3.5 h-3.5" />
+                  <span className="font-medium text-sm">Passive night</span>
+                </div>
+                <p className={`text-xs mt-0.5 ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>
+                  Flat pay during passive hours, hourly rate for active hours
+                </p>
+              </div>
+            </label>
+
+            {isPassiveNight && (
+              <div className="mt-4 space-y-3 pl-13">
+                <div>
+                  <label className={labelClass}>Passive flat pay</label>
+                  <div className="relative">
+                    <span className={`absolute left-3 top-1/2 -translate-y-1/2 text-sm ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>$</span>
+                    <input type="number" step="0.01" min="0" className={inputClass + ' pl-7'} value={passiveFlatRate} onChange={e => setPassiveFlatRate(e.target.value)} />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className={labelClass}>Passive starts</label>
+                    <input type="time" className={inputClass} value={passiveStart} onChange={e => setPassiveStart(e.target.value)} />
+                  </div>
+                  <div>
+                    <label className={labelClass}>Passive ends</label>
+                    <input type="time" className={inputClass} value={passiveEnd} onChange={e => setPassiveEnd(e.target.value)} />
+                  </div>
+                </div>
+                <p className={`text-xs ${prefs.dark ? 'text-stone-500' : 'text-stone-400'}`}>
+                  Hours outside this window are paid at your hourly rate.
+                </p>
+              </div>
+            )}
           </div>
 
           <div>
@@ -1122,14 +1458,33 @@ function ShiftForm({ shift, jobs, onSave, onDelete, onCancel, prefs }) {
           {/* Summary */}
           {hrs > 0 && (
             <div className={`rounded-xl p-4 ${prefs.dark ? 'bg-stone-800/50' : 'bg-stone-100'}`}>
-              <div className="flex justify-between text-sm">
-                <span className={prefs.dark ? 'text-stone-400' : 'text-stone-600'}>Total hours</span>
-                <span className="font-semibold">{hrs.toFixed(2)}h</span>
-              </div>
-              <div className="flex justify-between mt-1">
-                <span className={prefs.dark ? 'text-stone-400' : 'text-stone-600'}>Earnings</span>
-                <span className="font-display text-xl font-semibold">{fmtCurrency(earnings)}</span>
-              </div>
+              {isPassiveNight && breakdown ? (
+                <>
+                  <div className="flex justify-between text-sm">
+                    <span className={prefs.dark ? 'text-stone-400' : 'text-stone-600'}>Passive hours</span>
+                    <span className="font-medium">{breakdown.passiveHours.toFixed(2)}h · {fmtCurrency(parseFloat(passiveFlatRate) || 0)}</span>
+                  </div>
+                  <div className="flex justify-between text-sm mt-1">
+                    <span className={prefs.dark ? 'text-stone-400' : 'text-stone-600'}>Active hours</span>
+                    <span className="font-medium">{breakdown.activeHours.toFixed(2)}h · {fmtCurrency(breakdown.activeHours * (parseFloat(hourlyRate) || 0))}</span>
+                  </div>
+                  <div className={`flex justify-between mt-2 pt-2 border-t ${prefs.dark ? 'border-stone-700' : 'border-stone-200'}`}>
+                    <span className="font-medium">Total earnings</span>
+                    <span className="font-display text-xl font-semibold">{fmtCurrency(earnings)}</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex justify-between text-sm">
+                    <span className={prefs.dark ? 'text-stone-400' : 'text-stone-600'}>Total hours</span>
+                    <span className="font-semibold">{hrs.toFixed(2)}h</span>
+                  </div>
+                  <div className="flex justify-between mt-1">
+                    <span className={prefs.dark ? 'text-stone-400' : 'text-stone-600'}>Earnings</span>
+                    <span className="font-display text-xl font-semibold">{fmtCurrency(earnings)}</span>
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -1157,7 +1512,10 @@ function ShiftDetail({ shift, job, isConflict, onEdit, onDelete, onClose, prefs 
   if (!job) return null;
   const color = JOB_COLORS[job.colorIdx];
   const hrs = calculateHours(shift.startTime, shift.endTime);
-  const earnings = hrs * shift.hourlyRate;
+  const earnings = calculateEarnings(shift, job);
+  const breakdown = shift.isPassiveNight
+    ? calculatePassiveBreakdown(shift.startTime, shift.endTime, shift.passiveStart || '21:00', shift.passiveEnd || '08:00')
+    : null;
   const date = new Date(`${shift.date}T${shift.startTime}`);
   const dateLabel = date.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
 
@@ -1173,11 +1531,18 @@ function ShiftDetail({ shift, job, isConflict, onEdit, onDelete, onClose, prefs 
           </button>
           <p className="text-white/80 text-xs uppercase tracking-widest font-medium">{dateLabel}</p>
           <h3 className="font-display text-3xl font-semibold text-white mt-1">{job.name}</h3>
-          {isConflict && (
-            <div className="mt-3 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/20 backdrop-blur text-white text-xs font-medium">
-              <AlertTriangle className="w-3 h-3" /> Scheduling conflict
-            </div>
-          )}
+          <div className="flex flex-wrap gap-2 mt-3">
+            {shift.isPassiveNight && (
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/20 backdrop-blur text-white text-xs font-medium">
+                <Moon className="w-3 h-3" /> Passive night
+              </div>
+            )}
+            {isConflict && (
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/20 backdrop-blur text-white text-xs font-medium">
+                <AlertTriangle className="w-3 h-3" /> Scheduling conflict
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="p-6 space-y-5">
@@ -1190,12 +1555,29 @@ function ShiftDetail({ shift, job, isConflict, onEdit, onDelete, onClose, prefs 
             <div>
               <p className={`text-[10px] uppercase tracking-widest font-medium ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>Duration</p>
               <p className="font-display text-xl font-semibold mt-1">{hrs.toFixed(2)}h</p>
-              <p className={`text-sm ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>at ${shift.hourlyRate}/hr</p>
+              <p className={`text-sm ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>{shift.isPassiveNight ? 'mixed pay' : `at $${shift.hourlyRate}/hr`}</p>
             </div>
           </div>
 
+          {shift.isPassiveNight && breakdown && (
+            <div className={`rounded-xl p-4 ${prefs.dark ? 'bg-stone-800/50' : 'bg-stone-100'} space-y-2`}>
+              <div className="flex justify-between text-sm">
+                <span className={`flex items-center gap-1.5 ${prefs.dark ? 'text-stone-400' : 'text-stone-600'}`}>
+                  <Moon className="w-3.5 h-3.5" /> Passive ({breakdown.passiveHours.toFixed(2)}h)
+                </span>
+                <span className="font-medium">{fmtCurrency(shift.passiveFlatRate ?? 120)}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className={`flex items-center gap-1.5 ${prefs.dark ? 'text-stone-400' : 'text-stone-600'}`}>
+                  <Clock className="w-3.5 h-3.5" /> Active ({breakdown.activeHours.toFixed(2)}h × ${shift.hourlyRate})
+                </span>
+                <span className="font-medium">{fmtCurrency(breakdown.activeHours * shift.hourlyRate)}</span>
+              </div>
+            </div>
+          )}
+
           <div className={`rounded-xl p-4 ${prefs.dark ? 'bg-stone-800/50' : 'bg-stone-100'}`}>
-            <p className={`text-[10px] uppercase tracking-widest font-medium ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>Earnings</p>
+            <p className={`text-[10px] uppercase tracking-widest font-medium ${prefs.dark ? 'text-stone-400' : 'text-stone-500'}`}>Total earnings</p>
             <p className="font-display text-3xl font-semibold mt-1">{fmtCurrency(earnings)}</p>
           </div>
 
